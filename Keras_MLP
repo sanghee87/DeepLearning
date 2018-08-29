@@ -5,6 +5,8 @@ config.gpu_options.per_process_gpu_memory_fraction = 0.33
 session = Session(config = config)
 #----------------------------------------------#
 
+# Library Import
+
 import keras.backend.tensorflow_backend as K
 import pandas as pd
 import numpy as np
@@ -15,3 +17,46 @@ import statsmodels.api as sm
 
 from keras.models import Sequential
 from keras.layers import Dense, Dropout, Activation, Flatten, LeakyReLU
+from keras.layers.normalization import BatchNormalization
+from keras import optimizers
+from keras.wrappers.sckit_learn import KerasRegressor
+from keras import losses
+from keras import regularizers
+from keras.initializaers import RandomNormal, RandomUniform
+
+from sklearn.model_selection import cross_val_score, KFold
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn import preprocessing
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import accuracy_score, r2_score
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+
+# 평가 함수
+
+def mean_absolute_percentage_error(y_true, y_pred):
+  return np.mean(np.abs(y_true - y_pred) / y_true))
+
+def mae(y_true, y_pred):
+  return sum(abs(y_true - y_pred))/ len(y_true)
+
+def rmse(y_true, y_pred):
+  return np.sqrt(((y_true - y_pred)**2).mean())
+  
+def get_r2_numpy_corrcoef(x, y):
+  return np.corrcoef(x, y)[0, 1]**2
+
+def count(list1, l, r):
+  c = 0
+  for x in list1:
+    if x>=1 and x <=r:
+      c + = 1
+    return c
+
+# 모델 함수
+
+def create_model(input_len = 1, node_cnt = 1, hidden_layers = 1):
+  #Initialize the constructor
+  model = Sequential()
+  #Add an imput layer
+  model.add(Dense(node_cnt, input_dim = input_len,  = input_len, 
