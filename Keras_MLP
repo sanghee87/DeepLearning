@@ -1,62 +1,420 @@
-#-------------set gpu using tf ---------------#
 import tensorflow as tf
-config - tf.ConfigProto()
-config.gpu_options.per_process_gpu_memory_fraction = 0.33
-session = Session(config = config)
-#----------------------------------------------#
-
-# Library Import
-
-import keras.backend.tensorflow_backend as K
-import pandas as pd
-import numpy as np
 import os
-import math
-import gc
-import statsmodels.api as sm
+import sys
+import json
+import pickle
+import numpy as np
+from keras.layers import GlobalAveragePooling2D, Dense, Dropout, BatchNormalization
+from keras.models import Model
+from keras.callbacks import ModelCheckpoint
+from keras.preprocessing.image import ImageDataGenerator
+from keras import backend as K
+from keras.models import load_model
 
-from keras.models import Sequential
-from keras.layers import Dense, Dropout, Activation, Flatten, LeakyReLU
-from keras.layers.normalization import BatchNormalization
-from keras import optimizers
-from keras.wrappers.sckit_learn import KerasRegressor
-from keras import losses
-from keras import regularizers
-from keras.initializaers import RandomNormal, RandomUniform
+from keras.callbacks import TensorBoard
 
-from sklearn.model_selection import cross_val_score, KFold
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from sklearn import preprocessing
-from sklearn.pipeline import Pipeline
-from sklearn.metrics import accuracy_score, r2_score
-from sklearn.model_selection import train_test_split
-import matplotlib.pyplot as plt
+from time import time
 
-# 평가 함수
+import random
+from PIL import Image
+from shutil import copyfile
+from shutil import rmtree
 
-def mean_absolute_percentage_error(y_true, y_pred):
-  return np.mean(np.abs(y_true - y_pred) / y_true))
+from keras_efficientnets import EfficientNetB1
 
-def mae(y_true, y_pred):
-  return sum(abs(y_true - y_pred))/ len(y_true)
+from sklearn.utils.class_weight import compute_class_weight
 
-def rmse(y_true, y_pred):
-  return np.sqrt(((y_true - y_pred)**2).mean())
-  
-def get_r2_numpy_corrcoef(x, y):
-  return np.corrcoef(x, y)[0, 1]**2
+#### config
 
-def count(list1, l, r):
-  c = 0
-  for x in list1:
-    if x>=1 and x <=r:
-      c + = 1
-    return c
+# limit of image size for filtering 
+LIMIT_IMG_SIZE = float('inf')
 
-# 모델 함수
+# for oversampling : for imbalanced data
+# if MINIMUM_DATA_NUM == 0 : no upsampling
+MINIMUM_DATA_NUM = 3 # 500
+BATCH_SIZE = 30
+IMG_WIDTH, IMG_HEIGHT = 240, 240
+EPOCHS = 200
+file_format = 'hdf5'
+MONITOR_METRIC = 'val_loss'
 
-def create_model(input_len = 1, node_cnt = 1, hidden_layers = 1):
-  #Initialize the constructor
-  model = Sequential()
-  #Add an imput layer
-  model.add(Dense(node_cnt, input_dim = input_len,  = input_len, 
+gpu_no = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_no)
+early_stopping_patience=50
+
+def make_folder(name):
+    try:
+        os.makedirs(name, exist_ok=True)
+    except:
+        pass
+    
+def data_split(folder, save_folder, folder_lst, limit_img_size, minimum_data_num):
+    
+    make_folder(save_folder)
+
+    folder_list = folder_lst
+   
+    # class list & make folder
+    data_set = ['train', 'valid', 'test']
+
+    seed_num = 42
+    ratio1 = 0.8
+    ratio2 = 0.9
+    for dat in data_set:
+        make_folder(os.path.join(save_folder, dat))
+    print(folder_list)
+    for class_label in folder_list:
+        make_folder(os.path.join(save_folder, 'train', class_label))
+        make_folder(os.path.join(save_folder, 'valid', class_label))
+        make_folder(os.path.join(save_folder, 'test', class_label))
+        
+        temp = []
+        file_num = 0
+        
+        # modify code for subdirectory
+        for (path, dir, files) in os.walk(os.path.join(folder, class_label)):
+            file_num += len(files)
+            for filename in files:
+                temp.append(os.path.join(path, filename))
+                
+        iter_num = int(minimum_data_num/file_num) + 1
+        random.seed(seed_num)
+        random.shuffle(temp)
+        ind_num1 = int(len(temp)*ratio1)
+        ind_num2 = int(len(temp)*ratio2)
+        train_img = temp[:ind_num1]
+        valid_img = temp[ind_num1:ind_num2]
+        test_img = temp[ind_num2:]
+
+        for name in train_img:
+            if name.endswith('.db'):
+                continue
+            # modify code for subdirectory
+            img_name = name
+            name = name.split('/')[-1]
+            with Image.open(img_name) as img:
+                width, height = img.size
+                if (width > limit_img_size) or (height > limit_img_size):
+                    continue
+            for idx in range(iter_num):
+                dst = os.path.join(save_folder, 'train', class_label, name.split('.')[-2] + '_' + str(idx) + '.jpg')
+                copyfile(img_name, dst)                
+        for name in valid_img:
+            if name.endswith('.db'):
+                continue
+            img_name = name
+            name = name.split('/')[-1]
+            with Image.open(img_name) as img:
+                width, height = img.size
+                if (width > limit_img_size) or (height > limit_img_size):
+                    continue
+            for idx in range(iter_num):
+                dst = os.path.join(save_folder, 'valid', class_label, name.split('.')[-2] + '_' + str(idx) + '.jpg')
+                copyfile(img_name, dst)
+        for name in test_img:
+            if name.endswith('.db'):
+                continue
+            img_name = name
+            name = name.split('/')[-1]
+            with Image.open(img_name) as img:
+                width, height = img.size
+                if (width > limit_img_size) or (height > limit_img_size):
+                    continue
+            dst = os.path.join(save_folder, 'test', class_label, name)
+            copyfile(img_name, dst)
+            
+    print('data split finished')
+
+
+def data_augmentation(loc_train, loc_valid, loc_test, batch_size, img_width, img_height):
+    # reverse color
+    # rescaling would be applied AFTER ALL TRANSFORMATION finished!
+    # def reverse_color(image):
+    #     return 255. - image
+    
+    train_datagen = ImageDataGenerator(
+        rescale=1./255,
+        width_shift_range=0.05,
+        height_shift_range=0.05,
+        horizontal_flip=True,
+        vertical_flip = True,
+        rotation_range=90,
+        # preprocessing_function=reverse_color
+    )
+    
+    valid_datagen = ImageDataGenerator(
+        rescale=1./255,
+        # preprocessing_function=reverse_color
+    )
+    
+    test_datagen = ImageDataGenerator(
+        rescale=1./255,
+        # preprocessing_function=reverse_color
+    )
+    
+
+    train_generator = train_datagen.flow_from_directory(
+        directory=loc_train,
+        target_size=(img_width, img_height),
+        interpolation="bilinear",
+        color_mode="rgb",
+        batch_size=batch_size,
+        class_mode="categorical",
+        seed=42,
+        shuffle=True
+    )
+
+    valid_generator = valid_datagen.flow_from_directory(
+        directory=loc_valid,
+        target_size=(img_width, img_height),
+        interpolation="bilinear",
+        batch_size=batch_size,
+        class_mode="categorical",
+        seed=42,
+        shuffle=True
+    )
+
+    test_generator = test_datagen.flow_from_directory(
+        directory=loc_test,
+        target_size=(img_width, img_height),
+        interpolation="bilinear",
+        batch_size=1,
+        class_mode="categorical",
+        seed=42,
+        shuffle=False
+    )
+    return train_generator, valid_generator, test_generator
+
+def get_session():
+    config = tf.ConfigProto()
+    config.gpu_options.allow_growth = True
+    return tf.Session(config=config)
+
+
+def train_model(save_name, batch_size, epochs, img_width, 
+                img_height, num_classes, save_path, train_generator,
+                valid_generator, test_generator):
+    K.tensorflow_backend.set_session(get_session()) 
+    
+    base_model = EfficientNetB1(input_shape=(img_width, img_height, 3), include_top=False, weights='imagenet')
+    last = base_model.output
+    x = GlobalAveragePooling2D()(last)
+    # Dropout added
+    x = Dropout(0.5)(x)
+    x = Dense(1024, activation='linear')(x)
+    x = BatchNormalization()(x)
+    predictions = Dense(num_classes, activation='softmax')(x)
+
+    model = Model(base_model.input, predictions)
+    model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
+    
+    model_path = os.path.join(save_path, save_name)
+    # monitor : val_loss
+    
+    class_numbers = list(train_generator.classes)
+    cb_checkpoint = ModelCheckpoint(filepath=model_path, monitor=MONITOR_METRIC,
+                                    verbose=2, save_best_only=True)    
+    class_weight = compute_class_weight(class_weight='balanced',
+                                        classes=np.unique(class_numbers),
+                                        y = np.array(class_numbers))
+    print(class_weight)
+    tensorboard = TensorBoard(log_dir="./logs/fit2")
+    final_model = model.fit_generator(generator = train_generator,
+                                    steps_per_epoch = len(train_generator), 
+                                    epochs = epochs,
+                                    validation_data = valid_generator,
+                                    validation_steps = len(valid_generator),
+                                    callbacks = [
+                                        cb_checkpoint,
+                                        tensorboard
+                                        ],class_weight=class_weight,
+                                      verbose=2) # too long
+    return model, final_model
+
+
+def get_train_result_and_save(model, 
+                              final_model, 
+                              test_generator):
+    scores = model.evaluate_generator(test_generator, steps = len(test_generator))
+    # don't edit
+#     best_score_idx = best_epoch
+    train_result = {
+        "learning_rate":str(K.eval(model.optimizer.lr)),
+        "learning_loss":str(final_model.history['loss']),
+        "learning_acc":str(final_model.history['acc']),
+        "validation_loss":str(final_model.history['val_loss']),
+        "validation_acc":str(final_model.history['val_acc']),
+        "test_loss":str(scores[0]), 
+        "test_acc":str(scores[1])
+    }
+    
+    print('train_result')
+    print(train_result)
+
+
+K.clear_session()
+
+# save_folder = os.path.join(os.path.dirname(folder), version_data_root_path, 'image_after')
+folder = '/mnt/IVIA_STG/hyvis_m_data/fab/DRAM/011_labeled'
+save_folder = '/home/sanghee2/fab_011/temp'
+folder_list = os.listdir(folder)
+
+#### data split
+
+data_split(folder,
+           save_folder,
+           folder_list,
+           LIMIT_IMG_SIZE,
+           MINIMUM_DATA_NUM)
+
+loc_train = os.path.join(save_folder, "train")
+loc_valid = os.path.join(save_folder, "valid")
+loc_test = os.path.join(save_folder, "test")
+
+train_generator, valid_generator, test_generator = data_augmentation(loc_train, 
+                                                                     loc_valid,
+                                                                     loc_test,
+                                                                     BATCH_SIZE,
+                                                                     IMG_WIDTH,
+                                                                     IMG_HEIGHT)
+
+save_name = 'fab_dram_022.hdf5'
+save_path = '/home/sanghee2/fab_022/model'
+num_classes = len(folder_list)
+
+model, final_model = train_model(save_name, BATCH_SIZE, 
+                                              EPOCHS, IMG_WIDTH, 
+                                              IMG_HEIGHT, num_classes, 
+                                              save_path, train_generator, 
+                                              valid_generator, test_generator)
+
+get_train_result_and_save(model, 
+                          final_model,
+                          test_generator)
+
+K.clear_session()
+
+K.tensorflow_backend.set_session(get_session()) 
+model = load_model('./model/fab_dram_011.hdf5')
+
+test_datagen = ImageDataGenerator(
+    rescale=1./255,
+    # preprocessing_function=reverse_color
+)
+test_generator = test_datagen.flow_from_directory(
+directory='/mnt/IVIA_STG/hyvis_m_data/fab/DRAM/Sample_분류_제외',
+target_size=(IMG_WIDTH, IMG_HEIGHT),
+interpolation="bilinear",
+batch_size=1,
+class_mode='categorical',
+seed=42,
+shuffle=False
+)
+
+pred_list = []
+
+pred_list.append(model.predict_generator(test_generator, steps = len(test_generator)))
+
+predict = np.mean(pred_list, axis=0)
+y_pred = np.argmax(predict, axis=1)
+
+list_fd = list(set(y_pred))
+
+for i in list_fd:
+    os.mkdir(os.path.join('/mnt/IVIA_STG/hyvis_m_data/fab/DRAM/011_unlabeled_inf',str(i)))
+
+import shutil
+
+t_file_list = test_generator.filenames
+
+t_file_list[0]
+
+for i in range(len(t_file_list)):
+    shutil.copy(os.path.join('/mnt/IVIA_STG/hyvis_m_data/fab/DRAM/Sample_분류_제외',t_file_list[i]),
+                os.path.join('/mnt/IVIA_STG/hyvis_m_data/fab/DRAM/011_unlabeled_inf',str(y_pred[i])))
+
+
+
+
+
+
+
+
+
+y_true = test_generator.classes
+
+from sklearn.metrics import confusion_matrix
+import matplotlib.pyplot as plt  
+from sklearn.metrics import plot_confusion_matrix
+
+mat = confusion_matrix(y_true, y_pred)
+mat
+
+import pandas as pd
+
+mat_df = pd.DataFrame(mat)
+mat_df.index=test_generator.class_indices.keys()
+mat_df.columns = test_generator.class_indices.keys()
+
+mat_df
+
+import pandas as pd
+df = pd.concat([pd.DataFrame(test_generator.classes), pd.DataFrame(y_pred)], axis = 1)
+df.columns = ['real', 'pred']
+
+true_v = df[df['real'] == df['pred']]
+error_v = df[df['real'] != df['pred']]
+
+test_generator.class_indices.keys()
+
+error_i = error_v.astype(str)
+error_i = error_i[error_i['pred'].str.contains('0') | error_i['pred'].str.contains('2')| error_i['pred'].str.contains('4')| error_i['pred'].str.contains('7')]
+error_i = error_i[error_i['real'].str.contains('1') | error_i['real'].str.contains('3')| error_i['real'].str.contains('5')| error_i['real'].str.contains('6')| error_i['real'].str.contains('8')]
+
+t_file_names = list(error_i.index)
+error_i = error_i.reset_index(drop=True)
+LABELED = list(test_generator.class_indices.keys())
+
+plt.figure(figsize=(20,10))
+columns = 6
+for i in range(len(error_i.index)):
+    plt.subplot(len(error_i.index) / columns + 1, columns, i + 1)
+#     plt.title('y_prob: ' + str(np.round(y_prob[error_v.index[i]][0],3)) + '\n real class: '+ str(error_v.iloc[i]['real']) )
+    plt.title('real : ' + LABELED[int(error_i['real'][i])])
+    plt.xlabel('Pred : ' + LABELED[int(error_i['pred'][i])])
+    plt.imshow(test_generator[t_file_names[i]][0][0])
+
+error_i
+
+error_i = error_v.astype(str)
+error_i = error_i[error_i['real'].str.contains('0') | error_i['real'].str.contains('2')| error_i['real'].str.contains('4')| error_i['real'].str.contains('7')]
+error_z = error_i[error_i['pred'].str.contains('1') | error_i['pred'].str.contains('3')| error_i['pred'].str.contains('5')| error_i['pred'].str.contains('6')| error_i['pred'].str.contains('8')]
+
+t_file_names = list(error_z.index)
+error_z = error_z.reset_index(drop=True)
+LABELED = list(test_generator.class_indices.keys())
+
+plt.figure(figsize=(20,10))
+columns = 8
+for i in range(len(error_z.index)):
+    plt.subplot(len(error_z.index) / columns + 1, columns, i + 1)
+    plt.title('real : ' + LABELED[int(error_z['real'][i])])
+    plt.xlabel('Pred : ' + LABELED[int(error_z['pred'][i])])
+    plt.imshow(test_generator[t_file_names[i]][0][0])
+
+error_i = error_v.astype(str)
+error_z = error_i[error_i['pred'].str.contains('1') | error_i['pred'].str.contains('3')| error_i['pred'].str.contains('5')| error_i['pred'].str.contains('6')| error_i['pred'].str.contains('8')]
+
+error_z
+
+t_file_names = list(error_z.index)
+error_z = error_z.reset_index(drop=True)
+LABELED = list(test_generator.class_indices.keys())
+
+plt.figure(figsize=(20,10))
+columns = 8
+for i in range(len(error_z.index)):
+    plt.subplot(len(error_z.index) / columns + 1, columns, i + 1)
+    plt.title('real : ' + LABELED[int(error_z['real'][i])])
+    plt.xlabel('Pred : ' + LABELED[int(error_z['pred'][i])])
+    plt.imshow(test_generator[t_file_names[i]][0][0])
